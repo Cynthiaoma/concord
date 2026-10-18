@@ -145,7 +145,9 @@ the reason, and the rest of the file is loaded. Each import form offers a blank 
   before it, and an instruction that was never executed.
 
 A break can be acknowledged or resolved with a note. The sign-off holds only while the figures it
-was written against are unchanged; if the break moves, it reopens.
+was written against are unchanged; if the break moves, it reopens. See
+[`docs/breaks.md`](./docs/breaks.md) for the complete break-type glossary, root causes, investigation
+steps, and sign-off lifecycle.
 
 A reconciliation runs when a register is imported and whenever someone re-runs it. Nothing
 reconciles on a timer: a new day's comparison needs that day's register.
@@ -225,7 +227,7 @@ software: per asset and per seat.
 Contributions are welcome. Start with [`CONTRIBUTING.md`](./CONTRIBUTING.md) for setup and the
 rules that matter, and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for how the code fits
 together. To read the ledger from a new source, see
-[`docs/contributing/chain-source.md`](./docs/contributing/chain-source.md). Report security problems
+[`docs/contributing/chain-source.md`](./docs/contributing/chain-source.md), and see [`docs/breaks.md`](./docs/breaks.md) for the break-type glossary. Report security problems
 privately, as described in [`SECURITY.md`](./SECURITY.md).
 Everyone taking part is expected to follow the [Code of Conduct](./CODE_OF_CONDUCT.md).
 
