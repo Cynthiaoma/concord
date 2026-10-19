@@ -3,9 +3,12 @@ node_modules/
 !.env.example
 target/
 dist/
+temp_auto_push.bat
 coverage/
 .DS_Store
 data/
 *.tsbuildinfo
 test-results/
 playwright-report/
+.gitignore
+branch_structure.json
