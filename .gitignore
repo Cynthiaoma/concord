@@ -1,5 +1,4 @@
 node_modules/
-.env*
 !.env.example
 target/
 dist/
@@ -12,3 +11,4 @@ test-results/
 playwright-report/
 .gitignore
 branch_structure.json
+config.bat
