@@ -1,138 +1,112 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import fc from "fast-check";
+import type { AssetEvent } from "../src/events.js";
+import { replay } from "../src/holdings.js";
 
-// Event model mirrors the replay input: mint / transfer / burn / clawback.
-// `replay` is expected to be exported from the core package and to return a
-// HoldingsState with `balances`, `supply`, and `incomplete` fields.
-import { replay } from "../src/replay.js";
-
-type Addr = "a" | "b" | "c" | "d";
-
-type Event =
-  | { id: number; kind: "mint"; to: Addr; amount: number }
-  | { id: number; kind: "transfer"; from: Addr; to: Addr; amount: number }
-  | { id: number; kind: "burn"; from: Addr; amount: number }
-  | { id: number; kind: "clawback"; from: Addr; amount: number };
-
-const ADDRS: Addr[] = ["a", "b", "c", "d"];
-
-// Generates a sequence of events where every debit is covered by the running
-// balance, so no balance ever goes negative and `incomplete` stays empty.
-function validStream(maxLen: number): fc.Arbitrary<Event[]> {
-  return fc
-    .array(
-      fc.record({
-        kind: fc.constantFrom("mint", "transfer", "burn", "clawback"),
-        from: fc.constantFrom(...ADDRS),
-        to: fc.constantFrom(...ADDRS),
-        amount: fc.integer({ min: 1, max: 1000 }),
-        pick: fc.double({ min: 0, max: 1, noNaN: true }),
-      }),
-      { maxLength: maxLength }
-    )
-    .map((raw) => {
-      const balances = new Map<Addr, number>();
-      const events: Event[] = [];
-      let id = 1;
-      for (const r of raw) {
-        if (r.kind === "mint") {
-          balances.set(r.to, (balances.get(r.to) ?? 0) + r.amount);
-          events.push({ id: id++, kind: "mint", to: r.to, amount: r.amount });
-          continue;
-        }
-        const have = balances.get(r.from) ?? 0;
-        if (have === 0) {
-          // No funds to debit: fall back to a mint so the stream stays valid.
-          balances.set(r.from, (balances.get(r.from) ?? 0) + r.amount);
-          events.push({ id: id++, kind: "mint", to: r.from, amount: r.amount });
-          continue;
-        }
-        const amount = Math.min(r.amount, have);
-        balances.set(r.from, have - amount);
-        if (r.kind === "transfer") {
-          balances.set(r.to, (balances.get(r.to) ?? 0) + amount);
-          events.push({ id: id++, kind: "transfer", from: r.from, to: r.to, amount });
-        } else {
-          events.push({ id: id++, kind: r.kind, from: r.from, amount });
-        }
-      }
-      return events;
-    });
-}
-
-// Deterministic Fisher-Yates shuffle driven by fast-check's random source so
-// failing cases are reproducible from the seed.
-function shuffleArb<T>(items: T[]): fc.Arbitrary<T[]> {
-  return fc
-    .array(fc.double({ min: 0, max: 1, noNaN: true }), {
-      minLength: items.length,
-      maxLength: items.length,
-    })
-    .map((keys) => {
-      const indexed = items.map((item, i) => ({ item, key: keys[i] }));
-      indexed.sort((x, y) => x.key - y.key);
-      return indexed.map((x) => x.item);
-    });
-}
-
+const ADDRESSES = ["GA", "GB", "GC", "GD"] as const;
+const T0 = Date.parse("2026-10-01T00:00:00Z");
 const RUNS = { numRuns: 1000 };
 
-describe("replay property tests", () => {
-  it("shuffled input yields an identical HoldingsState", () => {
+const stepArb = fc.record({
+  kind: fc.constantFrom("mint", "transfer", "burn", "clawback"),
+  from: fc.constantFrom(...ADDRESSES),
+  to: fc.constantFrom(...ADDRESSES),
+  amount: fc.bigInt({ min: 1n, max: 1000n }),
+});
+
+/**
+ * Random event streams in which every debit is covered by the running balance, so no balance goes
+ * negative and `incomplete` stays empty. A debit from a holder with nothing becomes a mint to them.
+ * Ledgers are distinct, so event ids (and therefore replay order) are unique.
+ */
+const validStream: fc.Arbitrary<AssetEvent[]> = fc.array(stepArb, { maxLength: 40 }).map((steps) => {
+  const held = new Map<string, bigint>();
+  const events: AssetEvent[] = [];
+  const push = (kind: AssetEvent["kind"], amount: bigint, fields: { from?: string; to?: string }): void => {
+    const ledger = events.length + 1;
+    events.push({
+      id: `${String(ledger).padStart(10, "0")}-${String(ledger).padStart(10, "0")}`,
+      assetId: "CASSET",
+      kind,
+      ledger,
+      closedAt: new Date(T0 + ledger * 60_000).toISOString(),
+      txHash: `tx${ledger}`,
+      amount,
+      ...fields,
+    });
+  };
+  for (const step of steps) {
+    const have = held.get(step.from) ?? 0n;
+    if (step.kind === "mint" || have === 0n) {
+      const to = step.kind === "mint" ? step.to : step.from;
+      held.set(to, (held.get(to) ?? 0n) + step.amount);
+      push("mint", step.amount, { to });
+      continue;
+    }
+    const amount = step.amount < have ? step.amount : have;
+    held.set(step.from, have - amount);
+    if (step.kind === "transfer") {
+      held.set(step.to, (held.get(step.to) ?? 0n) + amount);
+      push("transfer", amount, { from: step.from, to: step.to });
+    } else {
+      push(step.kind, amount, { from: step.from });
+    }
+  }
+  return events;
+});
+
+/** A stream and the same events in another order. */
+const streamAndShuffle = validStream.chain((events) =>
+  fc
+    .shuffledSubarray(events, { minLength: events.length, maxLength: events.length })
+    .map((shuffled) => ({ events, shuffled })),
+);
+
+describe("replay properties", () => {
+  it("gives an identical state however the events are ordered", () => {
     fc.assert(
-      fc.property(
-        validStream(40).chain((events) =>
-          shuffleArb(events).map((shuffled) => ({ events, shuffled }))
-        ),
-        ({ events, shuffled }) => {
-          const original = replay(events);
-          const reordered = replay(shuffled);
-          expect(reordered).toEqual(original);
-        }
-      ),
-      RUNS
+      fc.property(streamAndShuffle, ({ events, shuffled }) => {
+        expect(replay(shuffled)).toEqual(replay(events));
+      }),
+      RUNS,
     );
   });
 
-  it("supply equals the sum of balances", () => {
+  it("keeps supply equal to the sum of the balances", () => {
     fc.assert(
-      fc.property(validStream(40), (events) => {
+      fc.property(validStream, (events) => {
         const state = replay(events);
-        const sum = Object.values(state.balances as Record<string, number>).reduce(
-          (acc, v) => acc + v,
-          0
-        );
+        let sum = 0n;
+        for (const amount of state.balances.values()) sum += amount;
         expect(state.supply).toBe(sum);
       }),
-      RUNS
+      RUNS,
     );
   });
 
-  it("supply equals mints minus burns and clawbacks", () => {
+  it("keeps supply equal to mints minus burns and clawbacks", () => {
     fc.assert(
-      fc.property(validStream(40), (events) => {
-        const state = replay(events);
-        let expected = 0;
+      fc.property(validStream, (events) => {
+        let expected = 0n;
         for (const e of events) {
           if (e.kind === "mint") expected += e.amount;
           else if (e.kind === "burn" || e.kind === "clawback") expected -= e.amount;
         }
-        expect(state.supply).toBe(expected);
+        expect(replay(events).supply).toBe(expected);
       }),
-      RUNS
+      RUNS,
     );
   });
 
-  it("no balance is negative and incomplete is empty for valid streams", () => {
+  it("never lets a balance go negative, and flags no incomplete history, for a valid stream", () => {
     fc.assert(
-      fc.property(validStream(40), (events) => {
+      fc.property(validStream, (events) => {
         const state = replay(events);
-        for (const v of Object.values(state.balances as Record<string, number>)) {
-          expect(v).toBeGreaterThanOrEqual(0);
-        }
+        for (const amount of state.balances.values()) expect(amount).toBeGreaterThanOrEqual(0n);
         expect(state.incomplete).toEqual([]);
+        expect(state.skipped).toBeUndefined();
       }),
-      RUNS
+      RUNS,
     );
   });
 });
